@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AlgoGrader SaaS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-10">
+
+    <div class="max-w-4xl mx-auto bg-white p-8 rounded-lg shadow-md">
+        <h1 class="text-3xl font-bold mb-6 text-blue-600">🤖 AlgoGrader SaaS</h1>
+        
+        <div class="mb-6 p-4 bg-blue-50 rounded">
+            <label class="block font-bold">Local Ollama URL:</label>
+            <input type="text" id="ollamaUrl" value="http://localhost:11434" class="w-full p-2 border rounded">
+            <p class="text-xs text-gray-500 mt-1">Make sure to run `ollama serve` with CORS enabled!</p>
+        </div>
+
+        <div id="uploadSection">
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block font-bold">Reference Ex1 (.alg)</label>
+                    <input type="file" id="ref1" class="mb-2">
+                    <label class="block font-bold">Reference Ex2 (.alg)</label>
+                    <input type="file" id="ref2" class="mb-2">
+                    <label class="block font-bold">Reference Ex3 (.alg)</label>
+                    <input type="file" id="ref3" class="mb-2">
+                    <label class="block font-bold">Reference Ex4 (.alg)</label>
+                    <input type="file" id="ref4" class="mb-2">
+                </div>
+                <div>
+                    <label class="block font-bold">Students ZIP Archive</label>
+                    <input type="file" id="zipFile" class="w-full p-2 border rounded bg-gray-50">
+                    <p class="text-sm text-gray-500">Zip the folder containing all student folders.</p>
+                </div>
+            </div>
+            <button onclick="startGrading()" class="mt-6 bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700 w-full font-bold">
+                Start Grading Pipeline
+            </button>
+        </div>
+
+        <div id="progressSection" class="hidden mt-8">
+            <h2 class="text-xl font-bold">Grading in Progress...</h2>
+            <div class="w-full bg-gray-200 rounded-full h-4 mt-2">
+                <div id="progressBar" class="bg-green-600 h-4 rounded-full" style="width: 0%"></div>
+            </div>
+            <div id="logs" class="mt-4 h-48 overflow-y-auto bg-gray-900 text-green-400 p-4 font-mono text-sm rounded"></div>
+            <button onclick="downloadCSV()" id="dlBtn" class="hidden mt-4 bg-green-600 text-white px-6 py-2 rounded">Download CSV</button>
+        </div>
+    </div>
+
+    <script>
+        let gradingResults = [];
+
+        async function startGrading() {
+            // 1. Upload files to Python Backend to get them parsed
+            const formData = new FormData();
+            formData.append('student_zip', document.getElementById('zipFile').files[0]);
+            formData.append('ref_ex1', document.getElementById('ref1').files[0]);
+            formData.append('ref_ex2', document.getElementById('ref2').files[0]);
+            formData.append('ref_ex3', document.getElementById('ref3').files[0]);
+            formData.append('ref_ex4', document.getElementById('ref4').files[0]);
+
+            log("📤 Uploading and Parsing Files on Server...");
+            
+            const response = await fetch('/parse', { method: 'POST', body: formData });
+            const data = await response.json();
+            
+            log(`✅ Server Parsed ${data.students.length} students. Starting AI Grading locally...`);
+            
+            document.getElementById('uploadSection').classList.add('hidden');
+            document.getElementById('progressSection').classList.remove('hidden');
+
+            await processGrading(data.students, data.references);
+        }
+
+        async function processGrading(students, references) {
+            const ollamaUrl = document.getElementById('ollamaUrl').value;
+            const total = students.length * 4;
+            let current = 0;
+
+            for (const student of students) {
+                let studentRow = { name: student.name, total: 0 };
+                
+                for (let i = 1; i <= 4; i++) {
+                    const exKey = `Ex${i}`;
+                    const sCode = student.submissions[exKey];
+                    const rCode = references[exKey];
+
+                    if (!sCode) {
+                        studentRow[exKey] = 0;
+                        studentRow[`${exKey}_just`] = "Missing";
+                        log(`❌ ${student.name} - ${exKey}: Missing`);
+                    } else {
+                        // CALL OLLAMA
+                        const scoreData = await callOllama(ollamaUrl, sCode, rCode);
+                        studentRow[exKey] = Math.min(scoreData.score, 5);
+                        studentRow[`${exKey}_just`] = scoreData.justification;
+                        studentRow.total += studentRow[exKey];
+                        log(`🤖 ${student.name} - ${exKey}: ${studentRow[exKey]}/5`);
+                    }
+                    
+                    current++;
+                    updateProgress(current, total);
+                }
+                gradingResults.push(studentRow);
+            }
+            log("🎉 Grading Complete!");
+            document.getElementById('dlBtn').classList.remove('hidden');
+        }
+
+        async function callOllama(url, studentCode, refCode) {
+            const prompt = `
+            Act as a teacher. Reference: ${refCode}. Student: ${studentCode}.
+            Rubric: 5pts if logic works (ignore syntax/names). 3pts if logic works but minor errors. 1pt if logic fails.
+            Output JSON only: {"score": int, "justification": "string"}
+            `;
+
+            try {
+                const response = await fetch(`${url}/api/generate`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        model: "qwen2.5-coder:14b",
+                        prompt: prompt,
+                        format: "json",
+                        stream: false,
+                        options: { temperature: 0.1 }
+                    })
+                });
+                const json = await response.json();
+                return JSON.parse(json.response);
+            } catch (e) {
+                return { score: 0, justification: "Error connecting to Local Ollama" };
+            }
+        }
+
+        function log(msg) {
+            const div = document.getElementById('logs');
+            div.innerHTML += `<div>${msg}</div>`;
+            div.scrollTop = div.scrollHeight;
+        }
+
+        function updateProgress(curr, total) {
+            const pct = (curr / total) * 100;
+            document.getElementById('progressBar').style.width = pct + "%";
+        }
+
+        function downloadCSV() {
+            // Simple CSV generation logic
+            let csvContent = "data:text/csv;charset=utf-8,Name,Ex1,Just1,Ex2,Just2,Ex3,Just3,Ex4,Just4,Total\n";
+            gradingResults.forEach(r => {
+                csvContent += `"${r.name}",${r.Ex1},"${r.Ex1_just}",${r.Ex2},"${r.Ex2_just}",${r.Ex3},"${r.Ex3_just}",${r.Ex4},"${r.Ex4_just}",${r.total}\n`;
+            });
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "grades.csv");
+            document.body.appendChild(link);
+            link.click();
+        }
+    </script>
+</body>
+</html>
